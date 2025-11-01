@@ -3,8 +3,10 @@ package cases
 import (
 	"context"
 	"errors"
+	"fmt"
 	"scheduler/internal/entity"
 	"scheduler/internal/port/repo"
+	"scheduler/pkg/utils/pointers"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,7 +38,7 @@ func NewSchedulerCase(jobsRepo JobsRepo) *SchedulerCase {
 // Create creates a new job and returns its ID.
 func (r *SchedulerCase) Create(ctx context.Context, job *entity.Job) (string, error) {
 	job.ID = uuid.NewString()
-	job.CreatedAt = time.Now().Unix()
+	job.CreatedAt = time.Now().UnixMilli()
 	job.Status = "queued" // Default status for new jobs
 
 	// Convert entity.Job to repo.JobDTO
@@ -70,7 +72,7 @@ func (r *SchedulerCase) GetOneByID(ctx context.Context, jobID string) (entity.Jo
 		if err == repo.ErrNotFound {
 			return entity.Job{}, ErrNotFound
 		}
-		return entity.Job{}, err
+		return entity.Job{}, fmt.Errorf("get job error :%w", err)
 	}
 
 	// Convert repo.JobDTO to entity.Job
@@ -93,7 +95,7 @@ func (r *SchedulerCase) Delete(ctx context.Context, jobID string) error {
 		if err == repo.ErrNotFound {
 			return ErrNotFound
 		}
-		return err
+		return fmt.Errorf("Delete error:%w", err)
 	}
 	return nil
 }
@@ -101,14 +103,14 @@ func (r *SchedulerCase) Delete(ctx context.Context, jobID string) error {
 func (r *SchedulerCase) List(ctx context.Context, status *string) ([]entity.Job, error) {
 	jobsDTO, err := r.jobsRepo.List(ctx, status)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("List read error:%w", err)
 	}
 
 	jobs := make([]entity.Job, 0, len(jobsDTO))
 	for _, j := range jobsDTO {
 		jobs = append(jobs, dtoToEntity(&j))
 	}
-	return jobs, nil
+	return jobs, fmt.Errorf("List error:%w", err)
 }
 
 func (r *SchedulerCase) ListExecutions(ctx context.Context, jobID string, workerID *string) ([]entity.Execution, error) {
@@ -118,7 +120,7 @@ func (r *SchedulerCase) ListExecutions(ctx context.Context, jobID string, worker
 
 	execDTOs, err := r.jobsRepo.ListExecutions(ctx, jobID, workerID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listExecution:%w", err)
 	}
 
 	execs := make([]entity.Execution, 0, len(execDTOs))
@@ -132,24 +134,17 @@ func (r *SchedulerCase) ListExecutions(ctx context.Context, jobID string, worker
 			FinishedAt: e.FinishedAt,
 		})
 	}
-	return execs, nil
+	return execs, fmt.Errorf("listExecution:%w", err)
 }
 
 func dtoToEntity(j *repo.JobDTO) entity.Job {
 	return entity.Job{
 		ID:             j.ID,
-		Once:           deref(j.Once),
-		Interval:       deref(j.Interval),
+		Once:           pointers.Deref(j.Once),
+		Interval:       pointers.Deref(j.Interval),
 		Status:         entity.Status(j.Status),
 		CreatedAt:      j.CreatedAt,
 		LastFinishedAt: j.LastFinishedAt,
 		Payload:        j.Payload,
 	}
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

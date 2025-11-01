@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/Masterminds/squirrel"
 	"github.com/jackc/pgx/v5"
 	"scheduler/internal/port/repo"
 
@@ -11,6 +13,19 @@ import (
 )
 
 //var _ repo.Jobs = (*JobsRepo)(nil)
+
+const (
+	createQuery = `
+		INSERT INTO jobs (id, once, interval, status, created_at, last_finished_at, payload)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`
+	readQuery = `
+		SELECT id, once, interval, status, created_at, last_finished_at, payload
+		FROM jobs
+		WHERE id = $1
+	`
+	deleteQuery = `DELETE FROM jobs WHERE id = $1`
+)
 
 type JobsRepo struct {
 	db *pgxpool.Pool
@@ -33,12 +48,7 @@ func (r *JobsRepo) Create(ctx context.Context, job *repo.JobDTO) error {
 	if err != nil {
 		return err
 	}
-
-	query := `
-		INSERT INTO jobs (id, once, interval, status, created_at, last_finished_at, payload)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
-	_, err = r.db.Exec(ctx, query,
+	_, err = r.db.Exec(ctx, createQuery,
 		job.ID,
 		job.Once,
 		job.Interval,
@@ -51,15 +61,10 @@ func (r *JobsRepo) Create(ctx context.Context, job *repo.JobDTO) error {
 }
 
 func (r *JobsRepo) Read(ctx context.Context, jobID string) (*repo.JobDTO, error) {
-	query := `
-		SELECT id, once, interval, status, created_at, last_finished_at, payload
-		FROM jobs
-		WHERE id = $1
-	`
 	var job repo.JobDTO
 	var payloadBytes []byte
 
-	err := r.db.QueryRow(ctx, query, jobID).Scan(
+	err := r.db.QueryRow(ctx, readQuery, jobID).Scan(
 		&job.ID,
 		&job.Once,
 		&job.Interval,
@@ -84,7 +89,7 @@ func (r *JobsRepo) Read(ctx context.Context, jobID string) (*repo.JobDTO, error)
 }
 
 func (r *JobsRepo) Delete(ctx context.Context, jobID string) error {
-	res, err := r.db.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID)
+	res, err := r.db.Exec(ctx, deleteQuery, jobID)
 	if err != nil {
 		return err
 	}
@@ -95,19 +100,22 @@ func (r *JobsRepo) Delete(ctx context.Context, jobID string) error {
 }
 
 func (r *JobsRepo) List(ctx context.Context, status *string) ([]repo.JobDTO, error) {
-	query := `
-		SELECT id, once, interval, status, created_at, last_finished_at, payload
-		FROM jobs
-	`
 	var rows pgx.Rows
 	var err error
+	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).
+		Select("id", "once", "interval", "status", "created_at", "last_finished_at", "payload").
+		From("jobs")
 
 	if status != nil {
-		query += ` WHERE status = $1`
-		rows, err = r.db.Query(ctx, query, *status)
-	} else {
-		rows, err = r.db.Query(ctx, query)
+		qb = qb.Where(squirrel.Eq{"status": *status})
 	}
+
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err = r.db.Query(ctx, sql, args...)
 
 	if err != nil {
 		return nil, err
@@ -130,31 +138,36 @@ func (r *JobsRepo) List(ctx context.Context, status *string) ([]repo.JobDTO, err
 		); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(payloadBytes, &j.Payload); err != nil {
-			return nil, err
-		}
 		jobs = append(jobs, j)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return jobs, nil
 }
 
 func (r *JobsRepo) ListExecutions(ctx context.Context, jobID string, workerID *string) ([]repo.ExecutionDTO, error) {
-	query := `
-		SELECT id, job_id, worker_id, status, started_at, finished_at
-		FROM executions
-		WHERE job_id = $1
-	`
-	var rows pgx.Rows
-	var err error
+	qb := squirrel.Select(
+		"id", "job_id", "worker_id", "status", "started_at", "finished_at",
+	).From("executions").
+		Where(squirrel.Eq{"job_id": jobID}).
+		PlaceholderFormat(squirrel.Dollar) // $1, $2 для PostgreSQL
 
+	// Добавляем фильтр по worker_id, только если передан
 	if workerID != nil {
-		query += ` AND worker_id = $2`
-		rows, err = r.db.Query(ctx, query, jobID, *workerID)
-	} else {
-		rows, err = r.db.Query(ctx, query, jobID)
+		qb = qb.Where(squirrel.Eq{"worker_id": *workerID})
 	}
 
+	// Генерируем SQL и аргументы
+	sql, args, err := qb.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build query: %w", err)
+	}
+
+	// Выполняем запрос
+	rows, err := r.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +187,10 @@ func (r *JobsRepo) ListExecutions(ctx context.Context, jobID string, workerID *s
 			return nil, err
 		}
 		execs = append(execs, e)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return execs, nil
 }

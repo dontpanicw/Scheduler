@@ -1,10 +1,9 @@
 package app
 
 import (
-	"fmt"
 	"github.com/go-chi/chi/v5"
 	middleware "github.com/oapi-codegen/nethttp-middleware"
-	"log"
+	"go.uber.org/zap"
 	"scheduler/config"
 	"scheduler/internal/adapter/repo/postgres"
 	"scheduler/internal/cases"
@@ -12,11 +11,12 @@ import (
 	"scheduler/internal/input/http/handler"
 )
 
-func Start(cfg *config.Config) error {
+func Start(cfg *config.Config, logger *zap.Logger) error {
 
 	jobsRepo, err := postgres.NewJobsRepo(cfg.PgConnStr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to DB: %w", err)
+		logger.Fatal("failed to connect to DB:", zap.Error(err))
+		return err
 	}
 
 	schedulerCase := cases.NewSchedulerCase(jobsRepo)
@@ -26,7 +26,8 @@ func Start(cfg *config.Config) error {
 
 	swagger, err := gen.GetSwagger()
 	if err != nil {
-		return fmt.Errorf("failed to load swagger: %w", err)
+		logger.Fatal("failed to load swagger", zap.Error(err))
+		return err
 	}
 	r.Use(middleware.OapiRequestValidator(swagger))
 
@@ -34,9 +35,9 @@ func Start(cfg *config.Config) error {
 	// Регистрируем в chi роутере (теперь strictHandler — это ServerInterface)
 	gen.HandlerFromMux(strictHandler, r)
 
-	log.Printf("Starting server on %s", cfg.Addr)
-	if err := CreateAndRunServer(r, fmt.Sprintf("localhost:%s", cfg.Addr)); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	logger.Info("Starting server on", zap.String("addr:", cfg.Addr))
+	if err := CreateAndRunServer(r, cfg.Addr); err != nil {
+		logger.Fatal("Failed to start server", zap.Error(err))
 	}
 	return nil
 }
