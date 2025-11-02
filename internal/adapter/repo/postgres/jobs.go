@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"github.com/Masterminds/squirrel"
 	"github.com/jackc/pgx/v5"
+	"scheduler/internal/cases"
 	"scheduler/internal/port/repo"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-//var _ repo.Jobs = (*JobsRepo)(nil)
+var _ cases.JobsRepo = (*JobsRepo)(nil)
 
 const (
 	createQuery = `
