@@ -2,10 +2,7 @@ package main
 
 import (
 	"database/sql"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/joho/godotenv"
 	"go.uber.org/zap"
-	"os"
 	"scheduler/config"
 	"scheduler/internal/app"
 	migrations "scheduler/pkg/migration/postgres"
@@ -20,25 +17,12 @@ func main() {
 	// Отложенный вызов — чтобы сбросить буферы при выходе
 	defer logger.Sync()
 
-	if err := godotenv.Load(); err != nil {
-		logger.Warn("could not load .env file",
-			zap.Error(err),
-		)
-	}
-	connStr := os.Getenv("POSTGRES_CONNECTION_STRING")
-	addr := os.Getenv("SERVER_ADDRESS")
-	if connStr == "" && addr == "" {
-		logger.Fatal("POSTGRES_CONNECTION_STRING or SERVER_ADDRESS is not set - добавьте их в .env")
-	} else {
-		logger.Info("config loaded",
-			zap.String("postgres_conn", connStr),
-			zap.String("server_addr", addr),
-		)
+	Config, err := config.NewConfig(logger)
+	if err != nil {
+		logger.Fatal("error creating config", zap.Error(err))
 	}
 
-	Config := config.NewConfig(connStr, addr)
-
-	db, err := sql.Open("pgx", Config.PgConnStr)
+	db, err := sql.Open("pgx", Config.PG.DSN)
 	if err != nil {
 		logger.Fatal("error with open pgx drivet", zap.Error(err))
 	}

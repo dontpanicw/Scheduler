@@ -2,196 +2,250 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Masterminds/squirrel"
-	"github.com/jackc/pgx/v5"
-	"scheduler/internal/cases"
+	"scheduler/internal/entity"
 	"scheduler/internal/port/repo"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var _ cases.JobsRepo = (*JobsRepo)(nil)
+var _ repo.Jobs = (*JobsRepo)(nil)
 
 const (
 	createQuery = `
-		INSERT INTO jobs (id, once, interval, status, created_at, last_finished_at, payload)
+		INSERT INTO jobs (id, kind, status, interval_seconds, once_timestamp, last_finished_at, payload)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
 	readQuery = `
-		SELECT id, once, interval, status, created_at, last_finished_at, payload
+		SELECT id, kind, status, interval_seconds, once_timestamp, last_finished_at, payload
 		FROM jobs
 		WHERE id = $1
 	`
 	deleteQuery = `DELETE FROM jobs WHERE id = $1`
+	listQuery   = `
+		SELECT id, kind, status, interval_seconds, once_timestamp, last_finished_at, payload
+		FROM jobs
+		ORDER BY id
+	`
+	upsertQuery = `
+		INSERT INTO jobs (id, kind, status, interval_seconds, once_timestamp, last_finished_at, payload)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO UPDATE SET
+			status = EXCLUDED.status,
+			interval_seconds = EXCLUDED.interval_seconds,
+			last_finished_at = EXCLUDED.last_finished_at
+	`
 )
 
 type JobsRepo struct {
-	db *pgxpool.Pool
+	pool *pgxpool.Pool
 }
 
-func NewJobsRepo(connString string) (*JobsRepo, error) {
-	db, err := pgxpool.New(context.Background(), connString)
-	if err != nil {
-		return nil, err
+func NewJobsRepo(pool *pgxpool.Pool) *JobsRepo {
+	return &JobsRepo{
+		pool: pool,
 	}
-	return &JobsRepo{db: db}, nil
 }
 
-func (r *JobsRepo) Close() {
-	r.db.Close()
-}
-
-func (r *JobsRepo) Create(ctx context.Context, job *repo.JobDTO) error {
+func (r *JobsRepo) Create(ctx context.Context, job *entity.Job) error {
 	payloadBytes, err := json.Marshal(job.Payload)
 	if err != nil {
 		return err
 	}
-	_, err = r.db.Exec(ctx, createQuery,
+
+	var intervalSeconds *int64
+	if job.Interval != nil {
+		seconds := int64(job.Interval.Seconds())
+		intervalSeconds = &seconds
+	}
+
+	_, err = r.pool.Exec(ctx, createQuery,
 		job.ID,
+		int(job.Kind),
+		string(job.Status),
+		intervalSeconds,
 		job.Once,
-		job.Interval,
-		job.Status,
-		job.CreatedAt,
 		job.LastFinishedAt,
 		payloadBytes,
 	)
 	return err
 }
 
-func (r *JobsRepo) Read(ctx context.Context, jobID string) (*repo.JobDTO, error) {
-	var job repo.JobDTO
-	var payloadBytes []byte
+func (r *JobsRepo) Read(ctx context.Context, jobID string) (*entity.Job, error) {
 
-	err := r.db.QueryRow(ctx, readQuery, jobID).Scan(
-		&job.ID,
-		&job.Once,
-		&job.Interval,
-		&job.Status,
-		&job.CreatedAt,
-		&job.LastFinishedAt,
-		&payloadBytes,
+	var (
+		id              string
+		kind            int
+		status          string
+		intervalSeconds sql.NullInt64
+		onceTimestamp   sql.NullInt64
+		lastFinishedAt  int64
+		payloadJSON     []byte
+	)
+
+	err := r.pool.QueryRow(ctx, readQuery, jobID).Scan(
+		&id,
+		&kind,
+		&status,
+		&intervalSeconds,
+		&onceTimestamp,
+		&lastFinishedAt,
+		&payloadJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, repo.ErrNotFound
+		return nil, repo.ErrJobNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read job: %w", err)
 	}
 
-	// Unmarshal payload from JSONB
-	if err := json.Unmarshal(payloadBytes, &job.Payload); err != nil {
-		return nil, err
+	var payload any
+	if len(payloadJSON) > 0 {
+		if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+			return nil, fmt.Errorf("unmarshal payload: %w", err)
+		}
 	}
 
-	return &job, nil
+	var interval *time.Duration
+	if intervalSeconds.Valid {
+		dur := time.Duration(intervalSeconds.Int64) * time.Second
+		interval = &dur
+	}
+
+	var once *int64
+	if onceTimestamp.Valid {
+		once = &onceTimestamp.Int64
+	}
+
+	return &entity.Job{
+		ID:             id,
+		Kind:           entity.JobKind(kind),
+		Status:         entity.JobStatus(status),
+		Interval:       interval,
+		Once:           once,
+		LastFinishedAt: lastFinishedAt,
+		Payload:        payload,
+	}, nil
 }
 
-func (r *JobsRepo) Delete(ctx context.Context, jobID string) error {
-	res, err := r.db.Exec(ctx, deleteQuery, jobID)
-	if err != nil {
-		return err
-	}
-	if res.RowsAffected() == 0 {
-		return repo.ErrNotFound
-	}
-	return nil
-}
+func (r *JobsRepo) List(ctx context.Context) ([]*entity.Job, error) {
 
-func (r *JobsRepo) List(ctx context.Context, status *string) ([]repo.JobDTO, error) {
-	var rows pgx.Rows
-	var err error
-	qb := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar).
-		Select("id", "once", "interval", "status", "created_at", "last_finished_at", "payload").
-		From("jobs")
-
-	if status != nil {
-		qb = qb.Where(squirrel.Eq{"status": *status})
-	}
-
-	sql, args, err := qb.ToSql()
-	if err != nil {
-		return nil, err
-	}
-
-	rows, err = r.db.Query(ctx, sql, args...)
-
+	rows, err := r.pool.Query(ctx, listQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var jobs []repo.JobDTO
-
+	var jobs []*entity.Job
 	for rows.Next() {
-		var j repo.JobDTO
-		var payloadBytes []byte
+		var (
+			id              string
+			kind            int
+			status          string
+			intervalSeconds sql.NullInt64
+			onceTimestamp   sql.NullInt64
+			lastFinishedAt  int64
+			payloadJSON     []byte
+		)
+
 		if err := rows.Scan(
-			&j.ID,
-			&j.Once,
-			&j.Interval,
-			&j.Status,
-			&j.CreatedAt,
-			&j.LastFinishedAt,
-			&payloadBytes,
+			&id,
+			&kind,
+			&status,
+			&intervalSeconds,
+			&onceTimestamp,
+			&lastFinishedAt,
+			&payloadJSON,
 		); err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, j)
+
+		var payload any
+		if len(payloadJSON) > 0 {
+			if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+				return nil, fmt.Errorf("unmarshal payload: %w", err)
+			}
+		}
+
+		var interval *time.Duration
+		if intervalSeconds.Valid {
+			dur := time.Duration(intervalSeconds.Int64) * time.Second
+			interval = &dur
+		}
+
+		var once *int64
+		if onceTimestamp.Valid {
+			once = &onceTimestamp.Int64
+		}
+
+		jobs = append(jobs, &entity.Job{
+			ID:             id,
+			Kind:           entity.JobKind(kind),
+			Status:         entity.JobStatus(status),
+			Interval:       interval,
+			Once:           once,
+			LastFinishedAt: lastFinishedAt,
+			Payload:        payload,
+		})
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rows error: %w", err)
 	}
 
 	return jobs, nil
 }
 
-func (r *JobsRepo) ListExecutions(ctx context.Context, jobID string, workerID *string) ([]repo.ExecutionDTO, error) {
-	qb := squirrel.Select(
-		"id", "job_id", "worker_id", "status", "started_at", "finished_at",
-	).From("executions").
-		Where(squirrel.Eq{"job_id": jobID}).
-		PlaceholderFormat(squirrel.Dollar) // $1, $2 для PostgreSQL
-
-	// Добавляем фильтр по worker_id, только если передан
-	if workerID != nil {
-		qb = qb.Where(squirrel.Eq{"worker_id": *workerID})
+func (r *JobsRepo) Upsert(ctx context.Context, jobs []*entity.Job) error {
+	if len(jobs) == 0 {
+		return nil
 	}
 
-	// Генерируем SQL и аргументы
-	sql, args, err := qb.ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("build query: %w", err)
-	}
-
-	// Выполняем запрос
-	rows, err := r.db.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var execs []repo.ExecutionDTO
-	for rows.Next() {
-		var e repo.ExecutionDTO
-		if err := rows.Scan(
-			&e.ID,
-			&e.JobID,
-			&e.WorkerID,
-			&e.Status,
-			&e.StartedAt,
-			&e.FinishedAt,
-		); err != nil {
-			return nil, err
+	for _, job := range jobs {
+		payloadJSON, err := json.Marshal(job.Payload)
+		if err != nil {
+			return err
 		}
-		execs = append(execs, e)
+
+		var intervalSeconds *int64
+		if job.Interval != nil {
+			seconds := int64(job.Interval.Seconds())
+			intervalSeconds = &seconds
+		}
+
+		_, err = r.pool.Exec(ctx, upsertQuery,
+			job.ID,
+			int(job.Kind),
+			string(job.Status),
+			intervalSeconds,
+			job.Once,
+			job.LastFinishedAt,
+			payloadJSON,
+		)
+
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, err
+	return nil
+}
+
+func (r *JobsRepo) Delete(ctx context.Context, jobID string) error {
+	result, err := r.pool.Exec(ctx, deleteQuery, jobID)
+	if err != nil {
+		return fmt.Errorf("failed to delete job: %w", err)
 	}
-	return execs, nil
+
+	if result.RowsAffected() == 0 {
+		return repo.ErrJobNotFound
+	}
+
+	return nil
 }

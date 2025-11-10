@@ -5,20 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"scheduler/internal/entity"
+	"scheduler/internal/port"
 	"scheduler/internal/port/repo"
-	"scheduler/pkg/utils/pointers"
+	"sync"
+
+	"go.uber.org/zap"
+
+	//"scheduler/pkg/utils/pointers"
 	"time"
 
 	"github.com/google/uuid"
 )
-
-type JobsRepo interface {
-	Create(ctx context.Context, job *repo.JobDTO) error
-	Read(ctx context.Context, jobID string) (*repo.JobDTO, error)
-	Delete(ctx context.Context, jobID string) error
-	List(ctx context.Context, status *string) ([]repo.JobDTO, error)
-	ListExecutions(ctx context.Context, jobID string, workerID *string) ([]repo.ExecutionDTO, error)
-}
 
 var (
 	ErrNotFound   = errors.New("not found")
@@ -26,125 +23,224 @@ var (
 )
 
 type SchedulerCase struct {
-	jobsRepo JobsRepo
+	jobsRepo  repo.Jobs
+	running   map[string]*entity.RunningJob
+	publisher port.JobPublisher
+	interval  time.Duration
+	mx        sync.Mutex
+	logger    *zap.Logger
 }
 
-func NewSchedulerCase(jobsRepo JobsRepo) *SchedulerCase {
+func NewSchedulerCase(
+	jobsRepo repo.Jobs,
+	publisher port.JobPublisher,
+	interval time.Duration,
+	logger *zap.Logger,
+) *SchedulerCase {
 	return &SchedulerCase{
-		jobsRepo: jobsRepo,
+		jobsRepo:  jobsRepo,
+		running:   make(map[string]*entity.RunningJob),
+		publisher: publisher,
+		interval:  interval,
+		logger:    logger,
 	}
 }
 
 // Create creates a new job and returns its ID.
 func (r *SchedulerCase) Create(ctx context.Context, job *entity.Job) (string, error) {
 	job.ID = uuid.NewString()
-	job.CreatedAt = time.Now().UnixMilli()
-	job.Status = "queued" // Default status for new jobs
+	job.Status = entity.JobStatusQueued // Default status for new jobs
 
-	// Convert entity.Job to repo.JobDTO
-	jobDTO := &repo.JobDTO{
-		ID:             job.ID,
-		Once:           &job.Once,
-		Interval:       &job.Interval,
-		Status:         repo.Status(job.Status),
-		CreatedAt:      job.CreatedAt,
-		LastFinishedAt: job.LastFinishedAt,
-		Payload:        job.Payload,
-	}
-
-	// Save to repository
-	if err := r.jobsRepo.Create(ctx, jobDTO); err != nil {
+	if err := r.jobsRepo.Create(ctx, job); err != nil {
 		return "", err
 	}
 
 	return job.ID, nil
 }
 
-// GetOneByID retrieves a job by its ID.
-func (r *SchedulerCase) GetOneByID(ctx context.Context, jobID string) (entity.Job, error) {
-	if jobID == "" {
-		return entity.Job{}, ErrInvalidJob
-	}
-
-	// Get job from repository
-	jobDTO, err := r.jobsRepo.Read(ctx, jobID)
+// Read retrieves a job by ID.
+func (r *SchedulerCase) Read(ctx context.Context, jobID string) (*entity.Job, error) {
+	job, err := r.jobsRepo.Read(ctx, jobID)
 	if err != nil {
-		if err == repo.ErrNotFound {
-			return entity.Job{}, ErrNotFound
+		if err == repo.ErrJobNotFound {
+			return nil, ErrNotFound
 		}
-		return entity.Job{}, fmt.Errorf("get job error :%w", err)
+		return nil, fmt.Errorf("read job: %w", err)
 	}
-
-	// Convert repo.JobDTO to entity.Job
-	return entity.Job{
-		ID:             jobDTO.ID,
-		Once:           *jobDTO.Once,
-		Interval:       *jobDTO.Interval,
-		Status:         entity.Status(jobDTO.Status),
-		CreatedAt:      jobDTO.CreatedAt,
-		LastFinishedAt: jobDTO.LastFinishedAt,
-		Payload:        jobDTO.Payload,
-	}, nil
+	return job, nil
 }
 
-func (r *SchedulerCase) Delete(ctx context.Context, jobID string) error {
-	if jobID == "" {
-		return ErrInvalidJob
+// List retrieves all jobs, optionally filtered by status.
+func (r *SchedulerCase) List(ctx context.Context, status *string) ([]*entity.Job, error) {
+	jobs, err := r.jobsRepo.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
 	}
+
+	// Filter by status if provided
+	if status != nil {
+		var filtered []*entity.Job
+		for _, job := range jobs {
+			if string(job.Status) == *status {
+				filtered = append(filtered, job)
+			}
+		}
+		return filtered, nil
+	}
+
+	return jobs, nil
+}
+
+// Delete removes a job by ID.
+func (r *SchedulerCase) Delete(ctx context.Context, jobID string) error {
+	// Remove from running jobs if it's running
+	r.mx.Lock()
+	if runningJob, ok := r.running[jobID]; ok {
+		runningJob.Cancel()
+		delete(r.running, jobID)
+	}
+	r.mx.Unlock()
+
+	// Delete from repository
 	if err := r.jobsRepo.Delete(ctx, jobID); err != nil {
-		if err == repo.ErrNotFound {
+		if err == repo.ErrJobNotFound {
 			return ErrNotFound
 		}
-		return fmt.Errorf("Delete error:%w", err)
+		return fmt.Errorf("delete job: %w", err)
 	}
+
 	return nil
 }
 
-func (r *SchedulerCase) List(ctx context.Context, status *string) ([]entity.Job, error) {
-	jobsDTO, err := r.jobsRepo.List(ctx, status)
-	if err != nil {
-		return nil, fmt.Errorf("List read error:%w", err)
-	}
+func (r *SchedulerCase) Start(ctx context.Context) error {
+	for {
+		select {
+		case <-time.NewTicker(r.interval).C:
+			if err := r.tick(ctx); err != nil {
 
-	jobs := make([]entity.Job, 0, len(jobsDTO))
-	for _, j := range jobsDTO {
-		jobs = append(jobs, dtoToEntity(&j))
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	return jobs, fmt.Errorf("List error:%w", err)
 }
 
-func (r *SchedulerCase) ListExecutions(ctx context.Context, jobID string, workerID *string) ([]entity.Execution, error) {
-	if jobID == "" {
-		return nil, ErrInvalidJob
-	}
-
-	execDTOs, err := r.jobsRepo.ListExecutions(ctx, jobID, workerID)
+func (r *SchedulerCase) tick(ctx context.Context) error {
+	jobs, err := r.jobsRepo.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listExecution:%w", err)
+		return fmt.Errorf("list jobs: %w", err)
 	}
 
-	execs := make([]entity.Execution, 0, len(execDTOs))
-	for _, e := range execDTOs {
-		execs = append(execs, entity.Execution{
-			Id:         e.ID,
-			JobId:      e.JobID,
-			WorkerId:   e.WorkerID,
-			Status:     e.Status,
-			StartedAt:  e.StartedAt,
-			FinishedAt: e.FinishedAt,
-		})
+	repoJobs := make(map[string]*entity.Job, len(jobs))
+	for _, j := range jobs {
+		repoJobs[j.ID] = j
 	}
-	return execs, fmt.Errorf("listExecution:%w", err)
+
+	r.mx.Lock()
+	for jobID, j := range r.running {
+		if _, ok := repoJobs[jobID]; !ok {
+			r.logger.Debug("stop deleted job", zap.String("job_id", jobID))
+			j.Cancel()
+			delete(r.running, jobID)
+		}
+	}
+	r.mx.Unlock()
+
+	now := time.Now().UnixMilli()
+	var updates []*entity.Job
+
+	for _, j := range jobs {
+		r.mx.Lock()
+		_, isRunning := r.running[j.ID]
+		r.mx.Unlock()
+
+		if isRunning {
+			r.logger.Debug("skip already running job", zap.String("job_id", j.ID))
+			continue
+		}
+
+		shouldRun := false
+		if j.Kind == entity.JobKindInterval {
+			if j.Interval != nil {
+				intervalMs := j.Interval.Milliseconds()
+				if j.LastFinishedAt == 0 || now >= j.LastFinishedAt+intervalMs {
+					shouldRun = true
+				}
+			}
+		} else if j.Kind == entity.JobKindOnce {
+			if j.Once != nil && j.LastFinishedAt == 0 && now >= *j.Once {
+				shouldRun = true
+			}
+		}
+
+		if shouldRun {
+			j.Status = entity.JobStatusQueued
+			updates = append(updates, j)
+			go r.runJob(ctx, j)
+		}
+	}
+	if len(updates) > 0 {
+		if err := r.jobsRepo.Upsert(ctx, updates); err != nil {
+			return fmt.Errorf("upsert started jobs: %w", err)
+		}
+	}
+
+	return nil
 }
 
-func dtoToEntity(j *repo.JobDTO) entity.Job {
-	return entity.Job{
-		ID:             j.ID,
-		Once:           pointers.Deref(j.Once),
-		Interval:       pointers.Deref(j.Interval),
-		Status:         entity.Status(j.Status),
-		CreatedAt:      j.CreatedAt,
-		LastFinishedAt: j.LastFinishedAt,
-		Payload:        j.Payload,
+func (r *SchedulerCase) runJob(ctx context.Context, j *entity.Job) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	r.mx.Lock()
+	r.running[j.ID] = &entity.RunningJob{
+		Job:    j,
+		Cancel: cancel,
 	}
+	r.mx.Unlock()
+
+	if r.publisher != nil {
+		if err := r.publisher.Publish(ctx, j); err != nil {
+			r.logger.Error("publish job", zap.Error(err), zap.String("job_id", j.ID))
+		}
+	}
+}
+
+// HandleJobCompletion handles job completion messages from workers
+func (r *SchedulerCase) HandleJobCompletion(ctx context.Context, jobID string, status string, finishedAt int64) error {
+	// Read the job from repository
+	job, err := r.jobsRepo.Read(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("read job: %w", err)
+	}
+
+	switch status {
+	case entity.JobStatusCompleted:
+		job.Status = entity.JobStatusCompleted
+	case entity.JobStatusFailed:
+		job.Status = entity.JobStatusFailed
+	default:
+		return fmt.Errorf("unknown status: %s", status)
+	}
+
+	job.LastFinishedAt = finishedAt
+
+	r.mx.Lock()
+	defer r.mx.Unlock()
+
+	if runningJob, ok := r.running[jobID]; ok {
+		runningJob.Cancel()
+		delete(r.running, jobID)
+	}
+
+	// Update job in repository
+	if err := r.jobsRepo.Upsert(ctx, []*entity.Job{job}); err != nil {
+		return fmt.Errorf("upsert job: %w", err)
+	}
+
+	r.logger.Info("Job completion handled",
+		zap.String("job_id", jobID),
+		zap.String("status", status),
+		zap.Int64("finished_at", finishedAt))
+
+	return nil
 }
