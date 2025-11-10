@@ -3,5 +3,5 @@ package repo
 import "errors"
 
 var (
-	ErrNotFound = errors.New("not found")
+	ErrJobNotFound = errors.New("Job not found")
 )
